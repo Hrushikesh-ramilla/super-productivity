@@ -70,13 +70,16 @@ The recognized crossings are:
   work context's order), so membership commutes in either order. Position in a
   shared list can depend on order; the device whose upload the server rejects
   reissues its op from the merged state, which converges it. The reissue
-  repositions only the rejected op's task, so an op anchored on the other op's
-  task (`afterTaskId`, `workContextAfterTaskId`) keeps the stop, as do two ops
+  repositions only the rejected op's task, so an op anchored on a task the
+  other op moves within the anchor's list (`afterTaskId` in the destination
+  section, `workContextAfterTaskId` in the work context's order) keeps the
+  stop, as do two ops
   of the same task other than the move/removal pair above. File-based
   providers never reject an upload and only reissue note and habit orders, so
   two such ops that land at the same position of one list (both at the top, or
-  both after one anchor) can order differently per device until the list is
-  next reordered (membership converges, order does not; no E2E covers this);
+  both after one anchor) can order differently per device until one of the
+  two tasks is moved again (membership converges, order does not; no E2E
+  covers this);
 - a section-order update crossing a placement/removal that touches one of the
   ordered sections;
 - a content reorder crossing a single-entity patch of an entity it lists, under

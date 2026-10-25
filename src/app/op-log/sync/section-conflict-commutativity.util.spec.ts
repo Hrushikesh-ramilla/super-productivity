@@ -1,4 +1,4 @@
-import { Action } from '@ngrx/store';
+import { Action, ActionReducer } from '@ngrx/store';
 import { Project, ProjectState } from '../../features/project/project.model';
 import { SectionState } from '../../features/section/section.model';
 import {
@@ -11,12 +11,16 @@ import {
   sectionReducer,
 } from '../../features/section/store/section.reducer';
 import { TagState } from '../../features/tag/tag.model';
+import { TaskState } from '../../features/tasks/task.model';
+import { RootState } from '../../root-store/root-state';
+import { sectionSharedMetaReducer } from '../../root-store/meta/task-shared-meta-reducers/section-shared.reducer';
 import { WorkContextType } from '../../features/work-context/work-context.model';
 import { extractActionPayload, Operation } from '../core/operation.types';
 import { PersistentAction } from '../core/persistent-action.interface';
 import {
   areCommutingSectionOperations,
   projectSectionReplayAgainstState,
+  SectionReplayStateCompensation,
 } from './section-conflict-commutativity.util';
 
 const P = 'project-1';
@@ -44,11 +48,40 @@ const toAction = (op: Operation): Action =>
     ...(extractActionPayload(op.payload) as Record<string, unknown>),
   }) as Action;
 
-const apply = (state: SectionState, actions: Action[]): SectionState =>
-  actions.reduce(sectionReducer, state);
+const COMPENSATE = '[test] project snapshot';
 
-const base = apply(
-  initialSectionState,
+// Keyed by the real feature names: the meta-reducer skips unhydrated slices.
+interface Snapshot {
+  tasks: TaskState;
+  tag: TagState;
+  projects: ProjectState;
+  section: SectionState;
+}
+
+// The real section meta-reducer, so a removal also moves the task in the work
+// context's `taskIds`.
+const reduce = sectionSharedMetaReducer(((state: Snapshot, action: Action) => ({
+  ...state,
+  section: sectionReducer(state.section, action),
+})) as unknown as ActionReducer<RootState, Action>);
+
+const apply = (state: Snapshot, actions: Action[]): Snapshot =>
+  actions.reduce(
+    (next, action) =>
+      action.type === COMPENSATE
+        ? {
+            ...next,
+            projects: {
+              ...next.projects,
+              entities: { [P]: (action as unknown as { project: Project }).project },
+            },
+          }
+        : (reduce(next as unknown as RootState, action) as unknown as Snapshot),
+    state,
+  );
+
+const sections = apply(
+  { section: initialSectionState } as Snapshot,
   [
     ['s1', ['mover', 'stay']],
     ['s2', ['other', 'last']],
@@ -64,31 +97,52 @@ const base = apply(
       },
     }),
   ),
-);
+).section;
 
-const tag: TagState = { ids: [], entities: {} } as unknown as TagState;
-const project: ProjectState = {
-  ids: [P],
-  entities: {
-    [P]: { id: P, taskIds: ['mover', 'stay', 'other', 'last', 'extra'] } as Project,
-  },
-} as unknown as ProjectState;
+const base: Snapshot = {
+  tasks: { ids: [], entities: {} } as unknown as TaskState,
+  tag: { ids: [], entities: {} } as unknown as TagState,
+  projects: {
+    ids: [P],
+    entities: {
+      [P]: {
+        id: P,
+        taskIds: ['mover', 'stay', 'other', 'last', 'extra', 'loose'],
+      } as Project,
+    },
+  } as unknown as ProjectState,
+  section: sections,
+};
 
-const lists = (state: SectionState): Record<string, string[]> =>
-  Object.fromEntries(
-    (state.ids as string[]).map((id) => [id, state.entities[id]!.taskIds]),
-  );
+const lists = (state: Snapshot): Record<string, string[]> => ({
+  ...Object.fromEntries(
+    (state.section.ids as string[]).map((id) => [
+      id,
+      state.section.entities[id]!.taskIds,
+    ]),
+  ),
+  project: state.projects.entities[P]!.taskIds,
+});
+
+/** Writes the full Project snapshot a reissued removal carries for old clients. */
+const compensate = (
+  compensation: SectionReplayStateCompensation | undefined,
+): Action[] =>
+  compensation
+    ? [{ type: COMPENSATE, project: compensation.entityState as Project } as Action]
+    : [];
 
 /** The rejected op, reissued from the state it was rejected in. */
-const reissue = (op: Operation, state: SectionState): Action[] => {
+const reissue = (op: Operation, state: Snapshot): Action[] => {
   const projection = projectSectionReplayAgainstState(op, {
-    section: state,
-    project,
-    tag,
+    section: state.section,
+    project: state.projects,
+    tag: state.tag,
   });
   if (projection.kind === 'superseded') return [];
+  if (projection.kind === 'work-context-state') return compensate(projection);
   if (projection.kind !== 'replay') throw new Error(projection.kind);
-  return [toAction(projection.operation)];
+  return [toAction(projection.operation), ...compensate(projection.stateCompensation)];
 };
 
 const MOVE = addTaskToSection({
@@ -98,13 +152,17 @@ const MOVE = addTaskToSection({
   sourceSectionId: 's1',
 }) as PersistentAction;
 
-const removal = (taskId: string, sectionId: string): PersistentAction =>
+const removal = (
+  taskId: string,
+  sectionId: string,
+  workContextAfterTaskId: string | null = null,
+): PersistentAction =>
   removeTaskFromSection({
     sectionId,
     taskId,
     workContextId: P,
     workContextType: WorkContextType.PROJECT,
-    workContextAfterTaskId: null,
+    workContextAfterTaskId,
   }) as PersistentAction;
 
 const placement = (
@@ -121,7 +179,11 @@ const placement = (
   }) as PersistentAction;
 
 describe('section list writes of different tasks (#10969)', () => {
-  const DIFFERENT_TASKS: { name: string; action: PersistentAction }[] = [
+  const DIFFERENT_TASKS: {
+    name: string;
+    first?: PersistentAction;
+    action: PersistentAction;
+  }[] = [
     { name: 'another task moved S3 → S1', action: placement('extra', 's1', 's3', null) },
     {
       name: 'another task moved to the top of S2',
@@ -141,26 +203,47 @@ describe('section list writes of different tasks (#10969)', () => {
     },
     { name: 'another task removed from S1', action: removal('stay', 's1') },
     { name: 'another task removed from S2', action: removal('other', 's2') },
+    // Both removals put their task at the top of the project's order.
+    {
+      name: 'a removal from S2, as the other op a removal from S1',
+      first: removal('stay', 's1'),
+      action: removal('other', 's2'),
+    },
+    {
+      name: 'a removal from S1, as the other op another removal from S1',
+      first: removal('mover', 's1'),
+      action: removal('stay', 's1'),
+    },
+    // A removal anchors in the project's order, which a placement leaves alone.
+    {
+      name: 'another task removed to after the moved task',
+      action: removal('stay', 's1', 'mover'),
+    },
+    {
+      name: 'a removal to after a task placed from no section',
+      first: placement('loose', 's1', null, null),
+      action: removal('stay', 's1', 'loose'),
+    },
   ];
 
-  DIFFERENT_TASKS.forEach(({ name, action }) => {
-    const [move, edit] = [toOp(MOVE), toOp(action)];
+  DIFFERENT_TASKS.forEach(({ name, first = MOVE, action }) => {
+    const [move, edit] = [toOp(first), toOp(action)];
 
-    it(`a cross-section move commutes with ${name}`, () => {
+    it(`commutes with ${name}`, () => {
       expect(areCommutingSectionOperations(move, edit)).toBe(true);
       expect(areCommutingSectionOperations(edit, move)).toBe(true);
     });
 
     it(`converges with ${name} when the editor syncs first`, () => {
       // The mover applies the accepted edit, then reissues its rejected move.
-      const mover = apply(base, [MOVE, action]);
+      const mover = apply(base, [first, action]);
       const editor = apply(base, [action, ...reissue(move, mover)]);
       expect(lists(editor)).toEqual(lists(mover));
     });
 
     it(`converges with ${name} when the mover syncs first`, () => {
-      const editor = apply(base, [action, MOVE]);
-      const mover = apply(base, [MOVE, ...reissue(edit, editor)]);
+      const editor = apply(base, [action, first]);
+      const mover = apply(base, [first, ...reissue(edit, editor)]);
       expect(lists(mover)).toEqual(lists(editor));
     });
   });
@@ -183,6 +266,11 @@ describe('section list writes of different tasks (#10969)', () => {
       name: 'another task placed after the moved task',
       move: MOVE,
       action: placement('extra', 's1', 's3', 'mover'),
+    },
+    {
+      name: 'a removal to after a task removed concurrently',
+      move: removal('mover', 's1'),
+      action: removal('stay', 's1', 'mover'),
     },
     {
       name: 'a reorder of the task the move is placed after',

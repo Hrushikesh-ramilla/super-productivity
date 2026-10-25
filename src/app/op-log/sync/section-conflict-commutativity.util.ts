@@ -203,23 +203,56 @@ const getSectionOrder = (operation: Operation): SectionOrder | undefined => {
 export const isSectionTaskListWrite = (operation: Operation): boolean =>
   !!getSectionPlacement(operation) || !!getSectionRemoval(operation);
 
-const getSectionListWrite = (
-  operation: Operation,
-): { taskId: string; anchors: (string | null)[] } | undefined => {
+interface SectionListWrite {
+  taskId: string;
+  anchor: string | null;
+  /** The list the anchor is in. */
+  anchorList: string;
+  /** The lists the task is inserted into, moved in or removed from. */
+  lists: string[];
+}
+
+const sectionList = (sectionId: string): string => `section:${sectionId}`;
+
+const getSectionListWrite = (operation: Operation): SectionListWrite | undefined => {
   const placement = getSectionPlacement(operation);
-  if (placement) return { taskId: placement.taskId, anchors: [placement.afterTaskId] };
+  if (placement) {
+    const destination = sectionList(placement.destinationSectionId);
+    return {
+      taskId: placement.taskId,
+      anchor: placement.afterTaskId,
+      anchorList: destination,
+      lists: placement.sourceSectionId
+        ? [sectionList(placement.sourceSectionId), destination]
+        : [destination],
+    };
+  }
   const removal = getSectionRemoval(operation);
-  return removal && { taskId: removal.taskId, anchors: [removal.workContextAfterTaskId] };
+  if (!removal) return undefined;
+  const workContext = `${removal.workContextType}:${removal.workContextId}`;
+  return {
+    taskId: removal.taskId,
+    anchor: removal.workContextAfterTaskId,
+    anchorList: workContext,
+    lists: [sectionList(removal.sectionId), workContext],
+  };
 };
+
+const isAnchoredOnMovedTask = (
+  anchored: SectionListWrite,
+  other: SectionListWrite,
+): boolean =>
+  anchored.anchor === other.taskId && other.lists.includes(anchored.anchorList);
 
 /**
  * Placements and removals of different tasks each write only their own task's
  * membership, so membership commutes in either order. Position can depend on
  * order; the device whose upload is rejected reissues its op from the merged
  * state (`projectSectionReplayAgainstState`), which converges it (#10969).
- * The reissue repositions only the rejected op's task, so an op anchored on
- * the other op's task keeps the stop: its task would land elsewhere on each
- * device.
+ * The reissue repositions only the rejected op's task, so an op anchored on a
+ * task the other op moves within the anchor's list keeps the stop: its task
+ * would land elsewhere on each device. An anchor in a list the other op leaves
+ * alone (a removal's work-context anchor vs a placement) stays put.
  */
 const areSectionListWritesOfDifferentTasks = (
   first: Operation,
@@ -231,8 +264,8 @@ const areSectionListWritesOfDifferentTasks = (
     !!a &&
     !!b &&
     a.taskId !== b.taskId &&
-    !a.anchors.includes(b.taskId) &&
-    !b.anchors.includes(a.taskId)
+    !isAnchoredOnMovedTask(a, b) &&
+    !isAnchoredOnMovedTask(b, a)
   );
 };
 

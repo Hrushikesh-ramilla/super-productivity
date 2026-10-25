@@ -272,11 +272,13 @@ test.describe('@supersync Cross-section task move vs concurrent section edit (#1
 
 type OtherTaskDrag =
   | 'another task moved S3 → S1'
+  | 'another task moved S3 → top of S2'
   | 'another task reordered within S2'
   | 'another task removed from S1';
 
 const OTHER_TASK_DRAGS: OtherTaskDrag[] = [
   'another task moved S3 → S1',
+  'another task moved S3 → top of S2',
   'another task reordered within S2',
   'another task removed from S1',
 ];
@@ -351,6 +353,19 @@ test.describe('@supersync Cross-section task move vs concurrent drag of another 
             expected = {
               [s1]: [title('Extra'), title('Stay')],
               [s2]: [title('Mover'), title('Other'), title('Last')],
+              [s3]: [],
+            };
+          } else if (drag === 'another task moved S3 → top of S2') {
+            // Both tasks land at the top of S2, so the order depends on the
+            // reissue: the rejected op is replayed below the accepted one.
+            await dispatch(clientB.page, moveTask(id.Extra, s2, s3, null));
+            const top =
+              order === 'editor syncs first'
+                ? [title('Extra'), title('Mover')]
+                : [title('Mover'), title('Extra')];
+            expected = {
+              [s1]: [title('Stay')],
+              [s2]: [...top, title('Other'), title('Last')],
               [s3]: [],
             };
           } else if (drag === 'another task reordered within S2') {
