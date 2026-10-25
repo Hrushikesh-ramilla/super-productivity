@@ -15,8 +15,13 @@ import {
  * remote" dialog. The move writes only `taskIds` and the edit only `isExpanded`
  * or `title`, so both must apply on every device in either sync order.
  *
- * Actions are dispatched as the UI dispatches them (drag → addTaskToSection,
- * section header → updateSection). syncAndWait() fails on the conflict dialog.
+ * The same holds for a concurrent drag of a different task into, within or out
+ * of either section: each op writes only its own task's membership, and the
+ * device whose upload the server rejects reissues it from the merged state.
+ *
+ * Actions are dispatched as the UI dispatches them (drag → addTaskToSection or
+ * removeTaskFromSection, section header → updateSection). syncAndWait() fails
+ * on the conflict dialog.
  */
 
 type StoreLike = {
@@ -139,6 +144,17 @@ const updateSection = (
   meta: { isPersistent: true, entityType: 'SECTION', entityId: id, opType: 'UPD' },
 });
 
+/** The action task-list.component.ts dispatches for a drag to the no-section bucket. */
+const removeTask = (taskId: string, sectionId: string): Record<string, unknown> => ({
+  type: '[Section] Remove Task from Section',
+  sectionId,
+  taskId,
+  workContextId: 'TODAY',
+  workContextType: 'TAG',
+  workContextAfterTaskId: null,
+  meta: { isPersistent: true, entityType: 'SECTION', entityId: sectionId, opType: 'UPD' },
+});
+
 type Edit = 'collapse of the source section' | 'rename of the destination section';
 type FirstToSync = 'editor syncs first' | 'mover syncs first';
 
@@ -244,6 +260,141 @@ test.describe('@supersync Cross-section task move vs concurrent section edit (#1
           await clientC.sync.setupSuperSync(syncConfig);
           await clientC.sync.syncAndWait();
           expect(await readSections(clientC.page, [s1, s2])).toEqual(expected);
+        } finally {
+          if (clientA) await closeClient(clientA);
+          if (clientB) await closeClient(clientB);
+          if (clientC) await closeClient(clientC);
+        }
+      });
+    }
+  }
+});
+
+type OtherTaskDrag =
+  | 'another task moved S3 → S1'
+  | 'another task reordered within S2'
+  | 'another task removed from S1';
+
+const OTHER_TASK_DRAGS: OtherTaskDrag[] = [
+  'another task moved S3 → S1',
+  'another task reordered within S2',
+  'another task removed from S1',
+];
+
+test.describe('@supersync Cross-section task move vs concurrent drag of another task (#10969)', () => {
+  for (const drag of OTHER_TASK_DRAGS) {
+    for (const order of ORDERS) {
+      test(`move S1 → S2 vs ${drag}, ${order}`, async ({
+        browser,
+        baseURL,
+        testRunId,
+      }) => {
+        test.setTimeout(180000);
+        const appUrl = baseURL || 'http://localhost:4242';
+        const s1 = `s1-${testRunId}`;
+        const s2 = `s2-${testRunId}`;
+        const s3 = `s3-${testRunId}`;
+        const title = (name: string): string => `A-${testRunId}-${name}`;
+        let clientA: SimulatedE2EClient | null = null;
+        let clientB: SimulatedE2EClient | null = null;
+        let clientC: SimulatedE2EClient | null = null;
+
+        try {
+          const user = await createTestUser(testRunId);
+          const syncConfig = getSuperSyncConfig(user);
+
+          clientA = await createSimulatedClient(browser, appUrl, 'A', testRunId);
+          await clientA.workView.waitForTaskList();
+          await clientA.sync.setupSuperSync(syncConfig);
+          const id: Record<string, string> = {};
+          for (const name of ['Mover', 'Stay', 'Other', 'Last', 'Extra']) {
+            await clientA.workView.addTask(name);
+            id[name] = await getTaskId(clientA.page, title(name));
+          }
+          await dispatch(clientA.page, addSection(s1, 'One'));
+          await dispatch(clientA.page, addSection(s2, 'Two'));
+          await dispatch(clientA.page, addSection(s3, 'Three'));
+          await dispatch(clientA.page, moveTask(id.Mover, s1, null, null));
+          await dispatch(clientA.page, moveTask(id.Stay, s1, null, id.Mover));
+          await dispatch(clientA.page, moveTask(id.Other, s2, null, null));
+          await dispatch(clientA.page, moveTask(id.Last, s2, null, id.Other));
+          await dispatch(clientA.page, moveTask(id.Extra, s3, null, null));
+          await clientA.sync.syncAndWait();
+
+          clientB = await createSimulatedClient(browser, appUrl, 'B', testRunId);
+          await clientB.workView.waitForTaskList();
+          await clientB.sync.setupSuperSync(syncConfig);
+          await clientB.sync.syncAndWait();
+
+          const ids = [s1, s2, s3];
+          const tasksOf = async (page: Page): Promise<Record<string, string[]>> =>
+            Object.fromEntries(
+              Object.entries(await readSections(page, ids)).map(([sid, s]) => [
+                sid,
+                s?.tasks ?? ['[section missing]'],
+              ]),
+            );
+          const seeded = {
+            [s1]: [title('Mover'), title('Stay')],
+            [s2]: [title('Other'), title('Last')],
+            [s3]: [title('Extra')],
+          };
+          expect(await tasksOf(clientA.page)).toEqual(seeded);
+          expect(await tasksOf(clientB.page)).toEqual(seeded);
+
+          // Client A drags "Mover" from S1 to the top of S2.
+          await dispatch(clientA.page, moveTask(id.Mover, s2, s1, null));
+          // Client B, concurrently, drags a different task in S1 or S2.
+          let expected: Record<string, string[]>;
+          if (drag === 'another task moved S3 → S1') {
+            await dispatch(clientB.page, moveTask(id.Extra, s1, s3, null));
+            expected = {
+              [s1]: [title('Extra'), title('Stay')],
+              [s2]: [title('Mover'), title('Other'), title('Last')],
+              [s3]: [],
+            };
+          } else if (drag === 'another task reordered within S2') {
+            await dispatch(clientB.page, moveTask(id.Other, s2, s2, id.Last));
+            expected = {
+              [s1]: [title('Stay')],
+              [s2]: [title('Mover'), title('Last'), title('Other')],
+              [s3]: [title('Extra')],
+            };
+          } else {
+            await dispatch(clientB.page, removeTask(id.Stay, s1));
+            expected = {
+              [s1]: [],
+              [s2]: [title('Mover'), title('Other'), title('Last')],
+              [s3]: [title('Extra')],
+            };
+          }
+
+          const [first, second] =
+            order === 'editor syncs first' ? [clientB, clientA] : [clientA, clientB];
+          await first.sync.syncAndWait();
+          await second.sync.syncAndWait();
+          await first.sync.syncAndWait();
+          await second.sync.syncAndWait();
+
+          expect({
+            clientA: await tasksOf(clientA.page),
+            clientB: await tasksOf(clientB.page),
+          }).toEqual({ clientA: expected, clientB: expected });
+
+          // Persisted, not only in memory.
+          await clientA.page.reload();
+          await clientA.workView.waitForTaskList();
+          await clientB.page.reload();
+          await clientB.workView.waitForTaskList();
+          expect(await tasksOf(clientA.page)).toEqual(expected);
+          expect(await tasksOf(clientB.page)).toEqual(expected);
+
+          // A fresh device replays the server history to the same state.
+          clientC = await createSimulatedClient(browser, appUrl, 'C', testRunId);
+          await clientC.workView.waitForTaskList();
+          await clientC.sync.setupSuperSync(syncConfig);
+          await clientC.sync.syncAndWait();
+          expect(await tasksOf(clientC.page)).toEqual(expected);
         } finally {
           if (clientA) await closeClient(clientA);
           if (clientB) await closeClient(clientB);

@@ -203,6 +203,39 @@ const getSectionOrder = (operation: Operation): SectionOrder | undefined => {
 export const isSectionTaskListWrite = (operation: Operation): boolean =>
   !!getSectionPlacement(operation) || !!getSectionRemoval(operation);
 
+const getSectionListWrite = (
+  operation: Operation,
+): { taskId: string; anchors: (string | null)[] } | undefined => {
+  const placement = getSectionPlacement(operation);
+  if (placement) return { taskId: placement.taskId, anchors: [placement.afterTaskId] };
+  const removal = getSectionRemoval(operation);
+  return removal && { taskId: removal.taskId, anchors: [removal.workContextAfterTaskId] };
+};
+
+/**
+ * Placements and removals of different tasks each write only their own task's
+ * membership, so membership commutes in either order. Position can depend on
+ * order; the device whose upload is rejected reissues its op from the merged
+ * state (`projectSectionReplayAgainstState`), which converges it (#10969).
+ * The reissue repositions only the rejected op's task, so an op anchored on
+ * the other op's task keeps the stop: its task would land elsewhere on each
+ * device.
+ */
+const areSectionListWritesOfDifferentTasks = (
+  first: Operation,
+  second: Operation,
+): boolean => {
+  const a = getSectionListWrite(first);
+  const b = getSectionListWrite(second);
+  return (
+    !!a &&
+    !!b &&
+    a.taskId !== b.taskId &&
+    !a.anchors.includes(b.taskId) &&
+    !b.anchors.includes(a.taskId)
+  );
+};
+
 const isSectionOrderAndPlacementPair = (
   orderOperation: Operation,
   placementOperation: Operation,
@@ -249,6 +282,7 @@ export const areCommutingSectionOperations = (
   }
 
   return (
+    areSectionListWritesOfDifferentTasks(first, second) ||
     isSectionOrderAndPlacementPair(first, second) ||
     isSectionOrderAndPlacementPair(second, first)
   );
