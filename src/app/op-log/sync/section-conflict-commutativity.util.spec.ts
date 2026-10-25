@@ -132,17 +132,24 @@ const compensate = (
     ? [{ type: COMPENSATE, project: compensation.entityState as Project } as Action]
     : [];
 
-/** The rejected op, reissued from the state it was rejected in. */
-const reissue = (op: Operation, state: Snapshot): Action[] => {
+/**
+ * The rejected op, reissued from the state it was rejected in. Without the
+ * snapshot (it can lose LWW on the receiver), the replayed op must converge
+ * on its own.
+ */
+const reissue = (op: Operation, state: Snapshot, withSnapshot: boolean): Action[] => {
+  const snapshot = (
+    compensation: SectionReplayStateCompensation | undefined,
+  ): Action[] => (withSnapshot ? compensate(compensation) : []);
   const projection = projectSectionReplayAgainstState(op, {
     section: state.section,
     project: state.projects,
     tag: state.tag,
   });
   if (projection.kind === 'superseded') return [];
-  if (projection.kind === 'work-context-state') return compensate(projection);
+  if (projection.kind === 'work-context-state') return snapshot(projection);
   if (projection.kind !== 'replay') throw new Error(projection.kind);
-  return [toAction(projection.operation), ...compensate(projection.stateCompensation)];
+  return [toAction(projection.operation), ...snapshot(projection.stateCompensation)];
 };
 
 const MOVE = addTaskToSection({
@@ -205,11 +212,6 @@ describe('section list writes of different tasks (#10969)', () => {
     { name: 'another task removed from S2', action: removal('other', 's2') },
     // Both removals put their task at the top of the project's order.
     {
-      name: 'a removal from S2, as the other op a removal from S1',
-      first: removal('stay', 's1'),
-      action: removal('other', 's2'),
-    },
-    {
       name: 'a removal from S1, as the other op another removal from S1',
       first: removal('mover', 's1'),
       action: removal('stay', 's1'),
@@ -234,17 +236,21 @@ describe('section list writes of different tasks (#10969)', () => {
       expect(areCommutingSectionOperations(edit, move)).toBe(true);
     });
 
-    it(`converges with ${name} when the editor syncs first`, () => {
-      // The mover applies the accepted edit, then reissues its rejected move.
-      const mover = apply(base, [first, action]);
-      const editor = apply(base, [action, ...reissue(move, mover)]);
-      expect(lists(editor)).toEqual(lists(mover));
-    });
+    [true, false].forEach((withSnapshot) => {
+      const variant = withSnapshot ? '' : ', without the snapshot';
 
-    it(`converges with ${name} when the mover syncs first`, () => {
-      const editor = apply(base, [action, first]);
-      const mover = apply(base, [first, ...reissue(edit, editor)]);
-      expect(lists(mover)).toEqual(lists(editor));
+      it(`converges with ${name} when the editor syncs first${variant}`, () => {
+        // The mover applies the accepted edit, then reissues its rejected move.
+        const mover = apply(base, [first, action]);
+        const editor = apply(base, [action, ...reissue(move, mover, withSnapshot)]);
+        expect(lists(editor)).toEqual(lists(mover));
+      });
+
+      it(`converges with ${name} when the mover syncs first${variant}`, () => {
+        const editor = apply(base, [action, first]);
+        const mover = apply(base, [first, ...reissue(edit, editor, withSnapshot)]);
+        expect(lists(mover)).toEqual(lists(editor));
+      });
     });
   });
 
@@ -266,6 +272,11 @@ describe('section list writes of different tasks (#10969)', () => {
       name: 'another task placed after the moved task',
       move: MOVE,
       action: placement('extra', 's1', 's3', 'mover'),
+    },
+    {
+      name: 'another task placed after a task removed concurrently',
+      move: removal('stay', 's1'),
+      action: placement('extra', 's1', 's3', 'stay'),
     },
     {
       name: 'a removal to after a task removed concurrently',
